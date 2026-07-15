@@ -7,6 +7,9 @@ status: "Guide"
 
 publishedAt: "2026-07-15"
 
+coverImage: "/images/social/default-og.png"
+coverImageAlt: "Event-Driven Backend Systems"
+
 tags:
   - "Backend"
   - "Kafka"
