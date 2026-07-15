@@ -7,6 +7,9 @@ status: "دليل"
 
 publishedAt: "2026-07-15"
 
+coverImage: "/images/social/default-og.png"
+coverImageAlt: "الأنظمة الخلفية المعتمدة على الأحداث"
+
 tags:
   - "Backend"
   - "Kafka"
