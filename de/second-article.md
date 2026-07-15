@@ -7,6 +7,9 @@ status: "Leitfaden"
 
 publishedAt: "2026-07-15"
 
+coverImage: "/images/social/default-og.png"
+coverImageAlt: "Ereignisgesteuerte Backend-Systeme"
+
 tags:
   - "Backend"
   - "Kafka"
