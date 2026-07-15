@@ -7,7 +7,7 @@ status: "دليل"
 
 publishedAt: "2026-07-15"
 
-coverImage: "/images/social/default-og.png"
+coverImage: "https://www.aiu.edu/wp-content/uploads/2024/08/where-is-ai-used-1024x683-1.jpg"
 coverImageAlt: "الأنظمة الخلفية المعتمدة على الأحداث"
 
 tags:
