@@ -7,9 +7,6 @@ status: "Leitfaden"
 
 publishedAt: "2026-07-15"
 
-coverImage: "/images/articles/backend.png"
-coverImageAlt: "Backend"
-
 tags:
   - "Backend"
   - "Kafka"
