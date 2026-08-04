@@ -2,6 +2,7 @@
   "files": [
     "transactional-outbox-reliability.mdx",
     "idempotency-key-api-design.mdx",
-    "kafka-consumer-retry-dlq.mdx"
+    "kafka-consumer-retry-dlq.mdx",
+    "kubernetes-graceful-shutdown.mdx"
   ]
 }
