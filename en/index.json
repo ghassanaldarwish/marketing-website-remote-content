@@ -3,6 +3,7 @@
     "transactional-outbox-reliability.mdx",
     "idempotency-key-api-design.mdx",
     "kafka-consumer-retry-dlq.mdx",
-    "kubernetes-graceful-shutdown.mdx"
+    "kubernetes-graceful-shutdown.mdx",
+    "zero-downtime-database-migrations.mdx"
   ]
 }
