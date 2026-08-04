@@ -1,6 +1,7 @@
 {
   "files": [
     "transactional-outbox-reliability.mdx",
-    "idempotency-key-api-design.mdx"
+    "idempotency-key-api-design.mdx",
+    "kubernetes-graceful-shutdown.mdx"
   ]
 }
