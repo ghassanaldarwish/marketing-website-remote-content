@@ -1,0 +1,263 @@
+---
+title: "PostgreSQL Job Queues Need Leases, Not Just SKIP LOCKED"
+description: "Design a reliable PostgreSQL job queue with atomic claims, expiring leases, fencing tokens, bounded retries, observability, and failure-injection tests."
+category: "Backend Engineering"
+status: "Technical Analysis"
+publishedAt: "2026-08-04"
+updatedAt: "2026-08-04"
+coverImage: "https://raw.githubusercontent.com/ghassanaldarwish/marketing-website-remote-content/main/assets/articles/postgres-job-queue-leases/cover.png"
+coverImageAlt: "A PostgreSQL job queue feeding parallel workers through a claim gate, with an expired lease returning abandoned work to the queue"
+tags:
+  - "Backend Engineering"
+  - "PostgreSQL"
+  - "Distributed Systems"
+  - "Reliability"
+  - "Job Queues"
+stack:
+  - "PostgreSQL"
+  - "SQL"
+  - "TypeScript"
+icon: "workflow"
+featured: false
+order: 6
+draft: false
+translationKey: "postgres-job-queue-leases"
+---
+
+`FOR UPDATE SKIP LOCKED` is a useful concurrency primitive, but it is not a complete job queue. It can stop two workers from claiming the same row in one transaction. It cannot recover work after a worker crashes, prevent a stale worker from committing late, decide when to retry, or prove that an external side effect happened once.
+
+A reliable PostgreSQL queue needs a state machine around that primitive. The worker should claim jobs atomically, hold an expiring lease rather than a permanent ownership flag, carry a fencing token into every completion, and leave enough durable state for recovery and operations.
+
+This article develops that design as a reference architecture. It does not claim a measured production deployment.
+
+## The lock ends before the work does
+
+PostgreSQL documents `SKIP LOCKED` as an inconsistent view that is unsuitable for general-purpose reads but useful for multiple consumers accessing a queue-like table. That is exactly the intended use: concurrent workers can skip rows already locked by peers instead of waiting behind them.
+
+The usual mistake is keeping the database transaction open while performing the job:
+
+```sql
+BEGIN;
+
+SELECT *
+FROM jobs
+WHERE status = 'pending'
+ORDER BY available_at, id
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+
+-- call a remote API, render a file, or run a model
+
+DELETE FROM jobs WHERE id = $1;
+COMMIT;
+```
+
+This gives the row lock the same lifetime as the work. A slow dependency now means a long transaction. Long transactions retain locks, delay cleanup, consume connections, and make failure recovery depend on a database session. They also cannot make a remote API call part of the PostgreSQL transaction.
+
+The safer boundary is short: claim the row and commit immediately. The worker then processes outside the transaction. That creates a new requirement. Once the row lock is released, durable queue state must explain who owns the job and when that ownership expires.
+
+## Model a lease, not a permanent claim
+
+A compact schema can express the essential states:
+
+```sql
+CREATE TYPE job_status AS ENUM (
+  'pending', 'running', 'succeeded', 'dead'
+);
+
+CREATE TABLE jobs (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  queue_name text NOT NULL,
+  payload jsonb NOT NULL,
+  status job_status NOT NULL DEFAULT 'pending',
+  priority integer NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT now(),
+  attempt_count integer NOT NULL DEFAULT 0,
+  max_attempts integer NOT NULL DEFAULT 8,
+  lease_owner text,
+  lease_token bigint NOT NULL DEFAULT 0,
+  lease_expires_at timestamptz,
+  last_error_code text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz
+);
+
+CREATE INDEX jobs_claimable_idx
+  ON jobs (queue_name, priority DESC, available_at, id)
+  WHERE status = 'pending';
+
+CREATE INDEX jobs_expired_lease_idx
+  ON jobs (lease_expires_at)
+  WHERE status = 'running';
+```
+
+`lease_expires_at` turns ownership into a time-bounded claim. `lease_token` is a generation number. Every successful claim increments it, so the current worker can distinguish its lease from an older one even when both processes believe they own the same job.
+
+The payload should contain data required to execute the job, not unrestricted credentials. Keep secrets behind server-side references with access controls and rotation.
+
+## Claim and transition in one statement
+
+Do not select an ID in one transaction and update it in another. Between those operations, another worker can claim the same row. Use a locking subquery and update in one statement:
+
+```sql
+WITH candidate AS (
+  SELECT id
+  FROM jobs
+  WHERE queue_name = $1
+    AND status = 'pending'
+    AND available_at <= now()
+  ORDER BY priority DESC, available_at, id
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE jobs AS j
+SET status = 'running',
+    attempt_count = attempt_count + 1,
+    lease_owner = $2,
+    lease_token = lease_token + 1,
+    lease_expires_at = now() + interval '60 seconds'
+FROM candidate
+WHERE j.id = candidate.id
+RETURNING j.*;
+```
+
+The statement runs inside a short transaction. Under PostgreSQL's default Read Committed isolation, each command sees a snapshot taken when the command begins, while the locking clause resolves concurrent row updates according to the documented row-locking behavior. The important property here comes from the row lock and atomic update, not from assuming a repeatable snapshot.
+
+Claiming one job at a time is simple. A batch claim can reduce round trips, but it also increases the amount of invisible work held by one worker. Keep batches bounded and smaller than the amount a worker can complete within the lease window.
+
+## Use the lease token as a fence
+
+An expiring lease creates a race:
+
+1. Worker A claims job 42 with token 7.
+2. A pauses long enough for the lease to expire.
+3. Recovery returns the job to `pending`.
+4. Worker B claims it with token 8 and finishes.
+5. A resumes and attempts to report success.
+
+Checking only `job_id` would let A overwrite B's state. The completion update must include the token:
+
+```sql
+UPDATE jobs
+SET status = 'succeeded',
+    finished_at = now(),
+    lease_owner = NULL,
+    lease_expires_at = NULL
+WHERE id = $1
+  AND status = 'running'
+  AND lease_owner = $2
+  AND lease_token = $3
+  AND lease_expires_at > now();
+```
+
+A zero-row update means the worker no longer owns the lease. It must not mark the job complete.
+
+This fencing check protects queue state. It does not automatically fence an external system. If the job sends a payment request, email, webhook, or object-store write, pass a stable idempotency key when the destination supports one. Otherwise model the external action as durable state with an `uncertain` outcome and reconciliation. A database token cannot reverse a side effect that already escaped its transaction boundary.
+
+## Renew only while making progress
+
+Some jobs legitimately run longer than the initial lease. A worker can heartbeat by extending the expiry, again guarded by owner and token:
+
+```sql
+UPDATE jobs
+SET lease_expires_at = now() + interval '60 seconds'
+WHERE id = $1
+  AND status = 'running'
+  AND lease_owner = $2
+  AND lease_token = $3
+  AND lease_expires_at > now();
+```
+
+Do not renew forever merely because the process is alive. Tie renewal to evidence of progress when possible: a completed chunk, advancing cursor, or recent downstream acknowledgement. Set a maximum runtime separately from the rolling lease. This prevents a logically stuck worker from monopolizing a job indefinitely.
+
+Use database time for lease comparisons. Mixing worker clocks introduces skew into ownership decisions.
+
+## Recover abandoned work with a bounded policy
+
+A recovery task should scan expired running jobs and choose either retry or terminal failure:
+
+```sql
+UPDATE jobs
+SET status = CASE
+      WHEN attempt_count >= max_attempts THEN 'dead'::job_status
+      ELSE 'pending'::job_status
+    END,
+    available_at = CASE
+      WHEN attempt_count >= max_attempts THEN available_at
+      ELSE now() + interval '30 seconds'
+    END,
+    lease_owner = NULL,
+    lease_expires_at = NULL,
+    last_error_code = 'LEASE_EXPIRED'
+WHERE status = 'running'
+  AND lease_expires_at <= now();
+```
+
+The delay shown is illustrative. Real backoff should include jitter, a maximum delay, and a budget based on the dependency's recovery behavior and the workflow's latency objective.
+
+Classify failures before retrying. Invalid payloads and unsupported schema versions are unlikely to improve. Timeouts and short dependency outages may. Unknown exceptions deserve a small budget and complete diagnostics, not infinite attempts.
+
+A `dead` job is not deleted data. It is an operational state with an owner, retention policy, inspection path, and controlled replay procedure. Replay should create or reset work only after the failure cause is addressed, while preserving the original job identity and audit trail.
+
+## Ordering and fairness are separate requirements
+
+`ORDER BY priority DESC, available_at, id` gives workers a deterministic preference, not strict global order. `SKIP LOCKED` intentionally allows a worker to pass an earlier locked row. A stream of high-priority jobs can also starve low-priority work.
+
+If per-aggregate ordering matters, encode it explicitly. One approach is to allow only the lowest sequence number for a given aggregate to become claimable. Another is to route each aggregate to a serial executor. Both reduce concurrency and need tests for gaps and poisoned jobs.
+
+Fairness can use aging, queue-specific worker pools, or weighted scheduling. Do not promise FIFO merely because the claim query contains `ORDER BY`.
+
+## LISTEN and NOTIFY are wake-up signals, not storage
+
+Polling is durable because the table is the source of truth, but an aggressive poll interval wastes database work when the queue is empty. PostgreSQL `NOTIFY` can wake listening workers after an enqueue transaction commits. The documentation states that notifications issued inside a transaction are delivered only after commit.
+
+Use that as a latency optimization:
+
+1. Insert the durable job row.
+2. Call `pg_notify` in the same transaction.
+3. Wake workers after commit.
+4. Always query the jobs table for actual work.
+5. Keep a periodic poll to recover missed notifications or disconnected listeners.
+
+The notification payload is not the queue. A worker that was offline must still find every durable job from the table.
+
+## Operate the state machine
+
+Useful metrics describe age and transitions, not only row counts:
+
+- age of the oldest claimable job;
+- claim latency and completion latency by queue;
+- running jobs approaching lease expiry;
+- lease expirations and lost-fence completion attempts;
+- retries by error code and attempt number;
+- dead jobs and age of the oldest unresolved failure;
+- heartbeat failures;
+- claim query duration, lock waits, and database connection usage;
+- worker throughput and saturation.
+
+Alert on old work. A small queue can still be broken if its oldest job has not moved for an hour. Keep payloads and error fields bounded and privacy-aware; operational visibility does not require copying sensitive input into logs.
+
+## Test crashes at every boundary
+
+The most useful tests interrupt the lifecycle deliberately:
+
+1. Run concurrent claimers and verify that each tokenized lease is unique.
+2. Crash after claim commit but before processing, then verify expiry and reclaim.
+3. Pause worker A, let worker B reclaim, and verify A's stale completion updates zero rows.
+4. Crash after an external side effect but before queue completion, then verify the idempotency or reconciliation policy.
+5. Lose heartbeats during active work and verify the maximum duplicate-execution window.
+6. Exhaust retries and verify a visible terminal state rather than deletion.
+7. Keep one job locked and verify unrelated jobs continue through `SKIP LOCKED`.
+8. Flood a high-priority class and test the chosen fairness policy.
+9. Disconnect every listener and verify periodic polling still drains committed jobs.
+10. Build a backlog large enough to inspect query plans, index behavior, and recovery throughput.
+
+These tests define what “reliable” means. The SQL mechanism alone does not.
+
+## Practical conclusion
+
+PostgreSQL can be a strong job-queue foundation when the workload benefits from transactional enqueue, moderate operational surface, and direct inspection with SQL. The key is to keep its guarantees narrow.
+
+Use `FOR UPDATE SKIP LOCKED` to coordinate short atomic claims. Commit before doing slow work. Represent ownership as an expiring lease, increment a fencing token on every claim, and require that token for heartbeat and completion. Bound retries, retain terminal failures, treat `NOTIFY` as an optional wake-up path, and make external effects idempotent or reconcilable.
+
+A queue is not reliable because two workers avoid the same row. It is reliable when every crash leaves enough durable state for another process to decide what happens next.
