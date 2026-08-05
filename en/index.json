@@ -5,6 +5,7 @@
     "kafka-consumer-retry-dlq.mdx",
     "kubernetes-graceful-shutdown.mdx",
     "zero-downtime-database-migrations.mdx",
-    "postgres-job-queue-leases.mdx"
+    "postgres-job-queue-leases.mdx",
+    "deadline-propagation-timeout-budgets.mdx"
   ]
 }
