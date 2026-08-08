@@ -8,6 +8,7 @@
     "postgres-job-queue-leases.mdx",
     "deadline-propagation-timeout-budgets.mdx",
     "distributed-locks-fencing-tokens.mdx",
-    "backpressure-load-shedding.mdx"
+    "backpressure-load-shedding.mdx",
+    "cache-stampede-request-coalescing.mdx"
   ]
 }
