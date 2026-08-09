@@ -9,6 +9,7 @@
     "deadline-propagation-timeout-budgets.mdx",
     "distributed-locks-fencing-tokens.mdx",
     "backpressure-load-shedding.mdx",
-    "cache-stampede-request-coalescing.mdx"
+    "cache-stampede-request-coalescing.mdx",
+    "kafka-consumer-rebalance-design.mdx"
   ]
 }
